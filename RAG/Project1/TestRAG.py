@@ -1,50 +1,114 @@
-from langchain_community.llms import Ollama
+from langchain_ollama import OllamaLLM, OllamaEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import OllamaEmbeddings
 
-# 1. Load PDF
+# =========================
+# 1. LOAD PDF
+# =========================
 loader = PyPDFLoader("Prakash_Ranjan.pdf")
 documents = loader.load()
 
-# 2. Split text
-splitter = RecursiveCharacterTextSplitter(chunk_size=8000, chunk_overlap=1000)
-docs = splitter.split_documents(documents)
+print("\n✅ PDF Loaded Successfully")
+print(f"Total Pages: {len(documents)}")
 
-# 3. Embeddings
+# =========================
+# 2. SPLIT TEXT (BETTER CHUNKING)
+# =========================
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=700,
+    chunk_overlap=120
+)
+
+chunks = splitter.split_documents(documents)
+
+print(f"\n✅ Total Chunks Created: {len(chunks)}")
+
+# Optional: Debug first few chunks
+for i, chunk in enumerate(chunks[:3]):
+    print(f"\n--- Sample Chunk {i+1} ---")
+    print(chunk.page_content[:300])
+
+# =========================
+# 3. EMBEDDINGS
+# =========================
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
 
-# 4. Vector DB
-db = Chroma.from_documents(docs, embeddings)
+# =========================
+# 4. VECTOR DATABASE
+# =========================
+db = Chroma.from_documents(
+    documents=chunks,
+    embedding=embeddings
+)
 
-# 5. Retriever
-retriever = db.as_retriever(search_kwargs={"k": 8})
+# =========================
+# 5. RETRIEVER (IMPROVED)
+# =========================
+retriever = db.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": 6}
+)
 
-# 6. LLM
-llm = Ollama(model="gemma:2b")
+# =========================
+# 6. LLM (LOCAL MODEL)
+# =========================
+llm = OllamaLLM(model="tinyllama")
 
-# 7. Manual RAG loop
-while True:
-    query = input("Ask: ")
-    if query.lower() == "exit":
-        break
+# =========================
+# 7. QUERY ENHANCEMENT
+# =========================
+def enhance_query(user_query: str) -> str:
+    return f"""
+    You are searching a resume.
 
-    # ✅ FIXED LINE
-    docs = retriever.invoke(query)
+    Find the most relevant details to answer:
+    {user_query}
 
-    # Build context
-    context = "\n".join([doc.page_content for doc in docs])
-    
-    print("\n===== CONTEXT START =====\n")
-    print(context)
-    print("\n===== CONTEXT END =====\n")
+    Focus on:
+    - current company
+    - recent experience
+    - profile summary
+    """
 
-    # Better prompt (reduces hallucination)
-    prompt = f"""
-You are a helpful assistant.
-Answer ONLY from the context below.
-If the answer is not present, say "Not found in document".
+# =========================
+# 8. SIMPLE RE-RANKING
+# =========================
+def rerank_documents(docs):
+    return sorted(
+        docs,
+        key=lambda d: (
+            "202" in d.page_content,   # boost recent years
+            "present" in d.page_content.lower(),
+            "current" in d.page_content.lower()
+        ),
+        reverse=True
+    )
+
+# =========================
+# 9. BUILD CONTEXT
+# =========================
+def build_context(docs, max_chars=2000):
+    context = "\n\n".join([
+        f"[Source: {doc.metadata.get('source', 'unknown')}]\n{doc.page_content}"
+        for doc in docs
+    ])
+    return context[:max_chars]
+
+# =========================
+# 10. PROMPT TEMPLATE
+# =========================
+def create_prompt(context, query):
+    return f"""
+You are analyzing a resume.
+
+Answer ONLY using the context below.
+
+Rules:
+- If current company is mentioned, return it clearly
+- If not explicitly mentioned, infer from most recent experience
+- If still not found, say "Not found in document"
+- Keep answer short and precise
 
 Context:
 {context}
@@ -53,7 +117,38 @@ Question:
 {query}
 """
 
-    # Generate response
+# =========================
+# 11. INTERACTIVE LOOP
+# =========================
+print("\n💬 Ask questions about the document (type 'exit' to quit)\n")
+
+while True:
+    user_query = input("Ask: ")
+
+    if user_query.lower() == "exit":
+        print("👋 Exiting...")
+        break
+
+    # Enhance query
+    query = enhance_query(user_query)
+
+    # Retrieve documents
+    retrieved_docs = retriever.invoke(query)
+
+    # Re-rank documents
+    ranked_docs = rerank_documents(retrieved_docs)
+
+    # Build context
+    context = build_context(ranked_docs)
+
+    # Debug (optional)
+    print("\n===== CONTEXT PREVIEW =====")
+    print(context[:500])
+
+    # Create prompt
+    prompt = create_prompt(context, user_query)
+
+    # Get response
     response = llm.invoke(prompt)
 
-    print("\nAnswer:", response, "\n")
+    print("\n✅ Answer:", response, "\n")
